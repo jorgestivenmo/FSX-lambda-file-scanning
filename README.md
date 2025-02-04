@@ -20,7 +20,7 @@ La Lambda se encarga de:
 
 ###### Flujo de trabajo principal de la Lambda:
 
-```mermaid
+```text
     Lambda ->> FSx: Accede a los archivos del FSx
     Lambda ->> VisionOne: Escanear archivo para detectar amenazas
     VisionOne ->> Lambda: Devuelve resultados del análisis
