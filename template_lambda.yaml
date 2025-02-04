@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VPC:
+    Description: Select a VPC to deploy resources.
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-xxxxxxx
+  PrivateSubnets:
+    Description: Select multiple subnets from selected VPC.
+    Type: List<AWS::EC2::Subnet::Id>
+  PublicSubnets:
+    Description: Select one subnets from selected VPC.
+    Type: AWS::EC2::Subnet::Id
+  FileServersCIDR:
+    AllowedPattern: ((\d{1,3})\.){3}\d{1,3}/\d{1,2}
+    Default: 172.31.0.0/16
+    Description: Required for Security Groups. Enter CIDR Block (eg 172.31.0.0/16) for your file servers, You can add more entries in the prefix list resource.
+    Type: String
+  FSXHost:
+    Description: The DNS name or IP address of the FSx file system.
+    Type: String
+    Default: 172.31.0.10
+  S3BucketForLambda:
+    Description: S3 bucket Name  for lambda function and layer deployment package.
+    Type: String
+    Default: bucket-name
+  S3BucketForQuarantine:
+    Description: S3 bucket Name for quarantine inspection.
+    Type: String
+    Default: bucket-name
+  FSXShareFolder:
+    Description: The name of the shared folder on the FSx file system.
+    Type: String
+    Default: share
+  FSXUser:
+    Description: Username for accessing the FSx file system.
+    Type: String
+    Default: Admin
+  FSXPassword:
+    Description: Password for accessing the FSx file system.
+    Type: String
+    Default: Password
+  VisionOneApiKey:
+    Description: API key for VisionOne.
+    Type: String
+    Default: APIKey
+  VisionOneRegion:
+    Description: Region for VisionOne.
+    Type: String
+    Default: us-east-1
+  DeleteFilesFromFSx:
+    Description: Delete infected files from FSx shared  folder after scanning. [true, false]
+    Default: false
+    Type: String
+    AllowedValues: [true, false]
+  MaxSizeScannedFile:
+    Description: Maximum size of the file to be scanned in Megabytes [MB].
+    Type: Number
+    Default: 1536
+    MinValue: 0
+    MaxValue: 8192
+    ConstraintDescription: Must be a number between 0 and 10485760
+  # LambdaExcecutionHour:
+  #   Description: This value represents every x hours the lambda will be executed. The final result will be the conbination of hour and mintes.
+  #   Type: Number
+  #   Default: 12
+  #   MinValue: 0
+  #   MaxValue: 23
+  #   ConstraintDescription: Must be a number between 0 and 23
+  LambdaExcecutionMinute:
+    Description: This value represents every x minutes the lambda will be executed.
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1440
+    ConstraintDescription: Must be a number between 0 and 1440 (You should represent the shcedule time in minutes -> e.g. 24 hours = 1440 minutes)
+Resources:
+  FileServersPrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      PrefixListName: FS-CIDRs
+      AddressFamily: IPv4
+      MaxEntries: 10
+      Entries:
+      - Cidr: !Ref 'FileServersCIDR'
+        Description: CIDR block for File Servers
+      Tags:
+      - Key: Name
+        Value: FS Prefix List
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: SG for SMB Lambda and VisionOne
+      Tags:
+      - Key: Name
+        Value: LambdaSMBSG
+  LambdaSGEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: '0.0.0.0/0'
+      Description: HTTPS outbound to https
+      GroupId: !GetAtt LambdaSG.GroupId
+  LambdaSGEgress2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 445
+      ToPort: 445
+      DestinationPrefixListId: !Ref 'FileServersPrefixList'
+      Description: SMB outbound access to file servers CIDRs
+      GroupId: !GetAtt LambdaSG.GroupId
+  LambdaSGIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: '0.0.0.0/0'
+      Description: Allow inbound from the internet on port 443 (HTTPS)
+      GroupId: !GetAtt LambdaSG.GroupId
+  SecretsManagerVpceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref 'VPC'
+      GroupDescription: SG for Secrets Manager VPC endpoint
+      Tags:
+      - Key: Name
+        Value: SecretsManagerVpceSG
+  SecretsManagerVpceSGIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt 'LambdaSG.GroupId'
+      Description: HTTPS inbound from Lambda
+      GroupId: !GetAtt 'SecretsManagerVpceSG.GroupId'
+  SecretsManagerVpceSGEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !GetAtt 'LambdaSG.GroupId'
+      Description: HTTPS outbound to Lambda
+      GroupId: !GetAtt 'SecretsManagerVpceSG.GroupId'
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: '*'
+          Action:
+          - secretsmanager:GetSecretValue
+          Resource: !Sub '${MySecret}'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      SubnetIds: !Split
+      - ","
+      - !Sub
+        - '${privateSubnetsToString},${PublicSubnets}'
+        - privateSubnetsToString: !Join [",", !Ref "PrivateSubnets"]
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+      - !Ref 'SecretsManagerVpceSG'
+      VpcId: !Ref 'VPC'
+
+  MySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: FScredentials
+      Description: FSx access information and Vision One API KEY.
+      SecretString: !Sub '{"username":"${FSXUser}","password":"${FSXPassword}","host":"${FSXHost}","share":"${FSXShareFolder}","regiontrend":"${VisionOneRegion}","apikeytrend":"${VisionOneApiKey}"}'
+      Tags:
+      - Key: AppName
+        Value: AppB
+
+  MySecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref MySecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: EnableSecretsManagerPermissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub '${AWS::AccountId}'
+          Action: secretsmanager:*
+          Resource: !Ref MySecret
+        - Sid: RestrictGetSecretValueoperation
+          Effect: Deny
+          Principal: '*'
+          Action: secretsmanager:GetSecretValue
+          Resource: !Ref MySecret
+          Condition:
+            StringNotEquals:
+              aws:sourceVpce: !Sub '${SecretsManagerVPCEndpoint}'
+
+  IAMLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "FSxLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service:
+            - "lambda.amazonaws.com"
+          Action:
+          - "sts:AssumeRole"
+      Policies:
+      - PolicyName: "FSxLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "secretsmanager:GetSecretValue"
+            Resource: !GetAtt MySecret.Id
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: arn:aws:logs:*:*:*
+          - Effect: "Allow"
+            Action:
+            - "ec2:CreateNetworkInterface"
+            - "ec2:AttachNetworkInterface"
+            - "ec2:DeleteNetworkInterface"
+            - "ec2:DescribeNetworkInterfaces"
+            - "ec2:AssignPrivateIpAddresses"
+            - "ec2:UnassignPrivateIpAddresses"
+            - "ec2:DescribeSubnets"
+            Resource: "*"
+      - PolicyName: S3AccessPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:PutObjectAcl
+            Resource: !Sub 'arn:aws:s3:::${S3BucketForQuarantine}/*'
+
+  FsxFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IAMLambdaRole
+    Properties:
+      FunctionName: "FSXLambdaFunction"
+      Code:
+        S3Bucket: !Ref S3BucketForLambda
+        S3Key: lambda_app.zip
+      Handler: lambda_function.lambda_handler
+      Layers:
+      - !Ref FSXLambdaLayer
+      Runtime: python3.11
+      Description: A function to integarte with FSx file servers and VisionOne File Security
+      MemorySize: 3008
+      EphemeralStorage:
+        Size: 10240
+      Timeout: 900
+      Role: !GetAtt IAMLambdaRole.Arn
+      Environment:
+        Variables:
+          SECRET_FSX: !GetAtt MySecret.Id
+          # HOUR: !Ref LambdaExcecutionHour
+          MIN: !Ref LambdaExcecutionMinute
+          QUARENTINE_BUCKET_NAME: !Ref S3BucketForQuarantine
+          DELETE_FILES: !Ref DeleteFilesFromFSx
+          MAX_SIZE_SCANNED_FILE: !Ref MaxSizeScannedFile
+      VpcConfig:
+        SecurityGroupIds:
+        - !Ref 'LambdaSG'
+        SubnetIds: !Split
+        - ','
+        - !Join
+          - ','
+          - !Ref 'PrivateSubnets'
+
+  FSXLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+      - python3.11
+      Content:
+        S3Bucket: !Ref S3BucketForLambda
+        S3Key: lambda_layer.zip
+      LicenseInfo: MIT
+      Description: A layer to integarte with FSx file servers and VisionOne Scann files
+      LayerName: FSXLambdaLayer
+
+  ScheduleRuleToTriggerLambda:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule rule to trigger Lambda
+      ScheduleExpression: !Sub 'cron(0/${LambdaExcecutionMinute} * * * ? *)'
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt FsxFunction.Arn
+        Id: TargeFSXtLambda
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref "FsxFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+        - "ScheduleRuleToTriggerLambda"
+        - "Arn"

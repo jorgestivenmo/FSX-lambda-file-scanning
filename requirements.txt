@@ -1,0 +1,14 @@
+-i https://pypi.org/simple
+boto3
+botocore
+cffi
+cryptography
+jmespath
+pycparser
+pyspnego
+python-dateutil
+s3transfer
+six
+smbprotocol
+urllib3
+visionone-filesecurity
